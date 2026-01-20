@@ -2,16 +2,7 @@
 /data/
 /venv/
 /.vscode/
-videos/
-audios/
-videos_2/
-audios_2/
-videos_3/
-audios_3/
-CNBC videos
-Bloomberg videos
 
-cookies.txt
 
 # Python cache / virtualenv clutter
 __pycache__/
