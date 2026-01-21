@@ -1,11 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Headless crawler for Naver Finance research (company reports).
-Define page number first!
-Usage:
-    python 1_stockAnalysisReport.py --start 2025-12-22 --end 2025-12-23 --pages 2 --output data/ --no-headless
-"""
 from __future__ import annotations
 
 import argparse
@@ -52,6 +46,11 @@ LIST_URL_TPL = (
     "?keyword=&brokerCode=&searchType=writeDate&writeFromDate={start}"
     "&writeToDate={end}&itemName=&itemCode=&page={page}"
 )
+DEFAULT_START = "2025-12-22"
+DEFAULT_END = "2025-12-23"
+DEFAULT_PAGES = 2
+DEFAULT_OUTPUT = "data"
+DEFAULT_HEADLESS = True
 
 
 @dataclass
@@ -288,20 +287,21 @@ def crawl(start: str, end: str, pages: int, output_dir: str, headless: bool = Tr
 
 def main(argv: List[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Naver Finance research crawler (company)")
-    p.add_argument("--start", required=True, help="start date YYYY-MM-DD")
-    p.add_argument("--end", required=True, help="end date YYYY-MM-DD")
-    p.add_argument("--pages", type=int, default=1, help="number of list pages to crawl")
-    p.add_argument("--output", default="data", help="directory to save CSV")
+    p.add_argument("--start", default=DEFAULT_START, help="start date YYYY-MM-DD")
+    p.add_argument("--end", default=DEFAULT_END, help="end date YYYY-MM-DD")
+    p.add_argument("--pages", type=int, default=DEFAULT_PAGES, help="number of list pages to crawl")
+    p.add_argument("--output", default=DEFAULT_OUTPUT, help="directory to save CSV")
     p.add_argument("--no-headless", action="store_true", help="run Chrome with UI")
     args = p.parse_args(argv)
 
     try:
+        headless = DEFAULT_HEADLESS if not args.no_headless else False
         path = crawl(
             start=args.start,
             end=args.end,
             pages=max(1, args.pages),
             output_dir=args.output,
-            headless=not args.no_headless,
+            headless=headless,
         )
         print(f"Saved: {path}")
         return 0
