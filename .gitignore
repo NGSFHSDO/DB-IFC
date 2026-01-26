@@ -2,7 +2,8 @@
 /data/
 /venv/
 /.vscode/
-
+/scripts
+cookies.txt
 
 # Python cache / virtualenv clutter
 __pycache__/

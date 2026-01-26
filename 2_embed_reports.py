@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -9,11 +10,18 @@ import pandas as pd
 from langchain_openai import OpenAIEmbeddings
 from dotenv import load_dotenv
 from tqdm import tqdm
+from openpyxl import Workbook, load_workbook
 
-DEFAULT_INPUT_FILE = "data/stockAnalysisReport_2020-01-01_2025-10-10.parquet"
-DEFAULT_OUTPUT_XLSX = "data/kospidaq_embeddings.xlsx"
-DEFAULT_MAX_ROWS = None
-DEFAULT_SAVE_EVERY = 1000
+DEFAULT_INPUT_FILE = "data\stockAnalysisReport_2025-10-13_2025-12-31.parquet"
+DEFAULT_OUTPUT_XLSX = "data/kospidaq_embeddings_0.xlsx"
+DEFAULT_MAX_ROWS = None  # Set to None to process all rows
+DEFAULT_SAVE_EVERY = 100000
+DEFAULT_START_ROW = 0
+
+
+def _clean_excel_text(text: str) -> str:
+    # Excel rejects control chars (0x00-0x1F) except tab/newline.
+    return "".join(ch for ch in text if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 32)
 
 
 def normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
@@ -26,31 +34,41 @@ def normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _records_to_df(records: List[dict], embedding_dim: int) -> pd.DataFrame:
+def _records_to_rows(records: List[dict], embedding_dim: int) -> List[List[object]]:
     embedding_cols = [f"embedding_{i}" for i in range(1, embedding_dim + 1)]
-    return pd.DataFrame(
-        records,
-        columns=["date", "ticker", "broker", "target_price", "rating", "content", *embedding_cols],
-    )
+    columns = ["date", "ticker", "broker", "target_price", "rating", *embedding_cols]
+    rows: List[List[object]] = []
+    for record in records:
+        rows.append([record.get(col, "") for col in columns])
+    return rows
 
 
-def _write_excel(existing_df: pd.DataFrame | None, records: List[dict], embedding_dim: int, output_path: Path) -> pd.DataFrame:
+def _append_excel(records: List[dict], embedding_dim: int, output_path: Path) -> None:
     if not records or not embedding_dim:
-        return existing_df if existing_df is not None else pd.DataFrame()
-    new_df = _records_to_df(records, embedding_dim)
-    if existing_df is not None and not existing_df.empty:
-        out_df = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        out_df = new_df
+        return
+    embedding_cols = [f"embedding_{i}" for i in range(1, embedding_dim + 1)]
+    columns = ["date", "ticker", "broker", "target_price", "rating", *embedding_cols]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_excel(output_path, index=False)
-    return out_df
+    if output_path.exists():
+        wb = load_workbook(output_path)
+        ws = wb.active
+        header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        if header != columns:
+            raise ValueError("Excel header does not match expected columns; cannot append safely.")
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(columns)
+    for row in _records_to_rows(records, embedding_dim):
+        ws.append(row)
+    wb.save(output_path)
 
 
-def _infer_embedding_dim(df: pd.DataFrame) -> int:
+def _infer_embedding_dim_from_header(header: List[object]) -> int:
     max_idx = 0
-    for col in df.columns:
-        if not col.startswith("embedding_"):
+    for col in header:
+        if not isinstance(col, str) or not col.startswith("embedding_"):
             continue
         suffix = col.split("_", 1)[-1]
         if suffix.isdigit():
@@ -58,18 +76,31 @@ def _infer_embedding_dim(df: pd.DataFrame) -> int:
     return max_idx
 
 
+def _read_existing_excel_state(output_path: Path) -> Tuple[int, int]:
+    if not output_path.exists():
+        return 0, 0
+    wb = load_workbook(output_path, read_only=True)
+    ws = wb.active
+    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    embedding_dim = _infer_embedding_dim_from_header(header)
+    if not embedding_dim:
+        raise ValueError("Could not infer embedding dimension from existing Excel header.")
+    processed_count = max(ws.max_row - 1, 0)
+    return processed_count, embedding_dim
+
+
 def build_embedding_records(
     df: pd.DataFrame,
     max_rows: int | None,
     save_every: int,
     output_path: Path,
-    existing_df: pd.DataFrame | None,
     existing_embedding_dim: int,
-) -> Tuple[List[dict], int, pd.DataFrame | None]:
+) -> Tuple[List[dict], int, int]:
     embedder = OpenAIEmbeddings()
     records: List[dict] = []
     total = len(df)
     embedding_dim = existing_embedding_dim
+    written_count = 0
     for i, (_, row) in enumerate(tqdm(df.iterrows(), total=total, desc="Embedding", unit="row"), start=1):
         broker = row.get("broker", "")
         ticker = row.get("ticker", "")
@@ -80,7 +111,7 @@ def build_embedding_records(
         target_price = row.get("target_price", "")
         rating = row.get("rating", "")
         content = row.get("content", row.get("body", ""))
-        text = str(content).strip()
+        text = _clean_excel_text(str(content).strip())
         vector = embedder.embed_documents([text])[0]
         if not embedding_dim:
             embedding_dim = len(vector)
@@ -92,19 +123,19 @@ def build_embedding_records(
                 "broker": broker,
                 "target_price": str(target_price),
                 "rating": str(rating),
-                "content": str(content),
                 **embedding_cols,
             }
         )
         if i % 100 == 0 or i == total:
             print(f"Embedded {i}/{total} documents ({i/total:.1%})")
         if save_every and i % save_every == 0:
-            existing_df = _write_excel(existing_df, records, embedding_dim, output_path)
+            _append_excel(records, embedding_dim, output_path)
             print(f"Saved {i} rows to {output_path}")
+            written_count += len(records)
             records = []
         if max_rows and i >= max_rows:
             break
-    return records, embedding_dim, existing_df
+    return records, embedding_dim, written_count
 
 
 def main() -> None:
@@ -113,6 +144,7 @@ def main() -> None:
     output_path = Path(DEFAULT_OUTPUT_XLSX).resolve()
     max_rows = DEFAULT_MAX_ROWS if DEFAULT_MAX_ROWS is None else int(DEFAULT_MAX_ROWS)
     save_every = int(DEFAULT_SAVE_EVERY)
+    start_row = int(DEFAULT_START_ROW)
 
     if not input_path.exists():
         raise FileNotFoundError(f"Parquet file not found: {input_path}")
@@ -121,22 +153,36 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("No rows found in input parquet file.")
 
-    existing_df = None
     embedding_dim = 0
+    processed_count = 0
     if output_path.exists():
-        existing_df = pd.read_excel(output_path)
-        embedding_dim = _infer_embedding_dim(existing_df)
-        processed_count = len(existing_df)
-        if processed_count >= len(df):
-            print(f"All {processed_count} rows already embedded. Nothing to do.")
-            return
-        df = df.iloc[processed_count:].reset_index(drop=True)
+        try:
+            processed_count, embedding_dim = _read_existing_excel_state(output_path)
+        except Exception:
+            backup_path = output_path.with_name(
+                f"{output_path.stem}_corrupt_{time.strftime('%Y%m%d_%H%M%S')}{output_path.suffix}"
+            )
+            output_path.replace(backup_path)
+            print(f"Corrupt Excel moved to {backup_path}")
+            processed_count = 0
+            embedding_dim = 0
+        else:
+            if processed_count >= len(df):
+                print(f"All {processed_count} rows already embedded. Nothing to do.")
+                return
+            df = df.iloc[processed_count:].reset_index(drop=True)
+    elif start_row:
+        if start_row >= len(df):
+            raise RuntimeError(f"DEFAULT_START_ROW={start_row} is beyond input rows ({len(df)}).")
+        df = df.iloc[start_row:].reset_index(drop=True)
+        processed_count = start_row
 
-    records, embedding_dim, existing_df = build_embedding_records(
-        df, max_rows, save_every, output_path, existing_df, embedding_dim
+    records, embedding_dim, written_count = build_embedding_records(
+        df, max_rows, save_every, output_path, embedding_dim
     )
-    out_df = _write_excel(existing_df, records, embedding_dim, output_path)
-    print(f"Wrote {len(out_df)} rows to {output_path}")
+    _append_excel(records, embedding_dim, output_path)
+    written_count += len(records)
+    print(f"Wrote {processed_count + written_count} rows to {output_path}")
 
 
 if __name__ == "__main__":

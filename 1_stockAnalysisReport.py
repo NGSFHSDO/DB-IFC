@@ -46,11 +46,13 @@ LIST_URL_TPL = (
     "?keyword=&brokerCode=&searchType=writeDate&writeFromDate={start}"
     "&writeToDate={end}&itemName=&itemCode=&page={page}"
 )
-DEFAULT_START = "2025-12-22"
-DEFAULT_END = "2025-12-23"
-DEFAULT_PAGES = 2
+DEFAULT_START = "2025-10-13"
+DEFAULT_END = "2025-12-31"
+DEFAULT_PAGES = 74
+DEFAULT_START_PAGE = 1
 DEFAULT_OUTPUT = "data"
 DEFAULT_HEADLESS = True
+DEFAULT_SAVE_EVERY = 1000
 
 
 @dataclass
@@ -125,7 +127,114 @@ def _split_col(df_in: pd.DataFrame, col: str, prefix: str) -> pd.DataFrame:
     return df_in
 
 
-def crawl(start: str, end: str, pages: int, output_dir: str, headless: bool = True) -> str:
+def _build_output_df(rows: List[ReportRow]) -> pd.DataFrame:
+    # Build per-report lines and keep only line_2..line_6
+    per_report: List[List[str]] = []
+    for r in rows:
+        if not r.box_type_m:
+            continue
+        split = [ln.strip() for ln in r.box_type_m.splitlines() if ln.strip()]
+        if split:
+            per_report.append(split)
+
+    desired_cols = [f"line_{i}" for i in range(2, 7)]
+    if per_report:
+        norm_rows: List[Dict[str, str]] = []
+        for lst in per_report:
+            row: Dict[str, str] = {}
+            for i, col in zip(range(2, 7), desired_cols):
+                row[col] = lst[i - 1] if len(lst) >= i else ""
+            norm_rows.append(row)
+        df = pd.DataFrame(norm_rows, columns=desired_cols)
+    else:
+        df = pd.DataFrame(columns=desired_cols)
+
+    # Split line_3 and line_4 into parts
+    df = _split_col(df, "line_3", "line_3")
+    df = _split_col(df, "line_4", "line_4")
+
+    # Select and ensure columns
+    final_order = [
+        "line_2",
+        "line_3_p1",
+        "line_3_p2",
+        "line_3_p3",
+        "line_4_p1",
+        "line_4_p2",
+        "line_5",
+        "line_6",
+    ]
+    for col in final_order:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[final_order].copy()
+
+    # Temporary English keys
+    df = df.rename(
+        columns={
+            "line_2": "equity",
+            "line_3_p1": "broker",
+            "line_3_p2": "date",
+            "line_3_p3": "views",
+            "line_4_p1": "target",
+            "line_4_p2": "rating",
+            "line_5": "title",
+            "line_6": "body",
+        }
+    )
+
+    # Normalize values (label-agnostic)
+    if "views" in df.columns:
+        s = df["views"].fillna("").astype(str)
+        df["views"] = s.str.extract(r"(\d[\d,]*)", expand=False).fillna(s.str.strip())
+    if "target" in df.columns:
+        s = df["target"].fillna("").astype(str)
+        df["target"] = s.str.extract(r"(\d[\d,]*)", expand=False).fillna(s.str.strip())
+    if "rating" in df.columns:
+        s = df["rating"].fillna("").astype(str)
+        df["rating"] = s.str.replace(r"^\s*[^:|]+[:|]\s*", "", regex=True).str.strip()
+
+    # Option A: split equity and reconstruct title/content
+    parts = df["equity"].fillna("").astype(str).str.split(r"\s+", n=1, regex=True)
+    left = parts.str[0].fillna("").str.strip()
+    right = parts.str[1].fillna("").str.strip()
+    df["equity"] = left
+    df["title"] = right.where(right.ne(""), df["title"].fillna(""))
+    df["body"] = (df["title"].fillna("") + " " + df["body"].fillna("")).str.strip()
+
+    # Final select and rename to English (drop views, title)
+    out = df[["equity", "broker", "date", "target", "rating", "body"]].copy()
+    out.rename(
+        columns={
+            "equity": "ticker",
+            "broker": "broker",
+            "date": "date",
+            "target": "target_price",
+            "rating": "rating",
+            "body": "content",
+        },
+        inplace=True,
+    )
+    return out
+
+
+def _save_snapshot(rows: List[ReportRow], output_dir: str, start: str, end: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    out = _build_output_df(rows)
+    snapshot_path = os.path.join(output_dir, f"stockAnalysisReport_{start}_{end}_partial.parquet")
+    out.to_parquet(snapshot_path, index=False)
+    return snapshot_path
+
+
+def crawl(
+    start: str,
+    end: str,
+    pages: int,
+    start_page: int,
+    output_dir: str,
+    headless: bool = True,
+    save_every: int = 0,
+) -> str:
     RESTART_EVERY = 20
     RETRIES = 2
 
@@ -137,7 +246,7 @@ def crawl(start: str, end: str, pages: int, output_dir: str, headless: bool = Tr
     driver, wait = build_and_wait()
     rows: List[ReportRow] = []
     try:
-        for page in tqdm(range(1, pages + 1), desc="List pages", unit="page"):
+        for page in tqdm(range(start_page, pages + 1), desc="List pages", unit="page"):
             # periodic restart for stability
             if page != 1 and (page - 1) % RESTART_EVERY == 0:
                 try:
@@ -184,6 +293,8 @@ def crawl(start: str, end: str, pages: int, output_dir: str, headless: bool = Tr
                         break
                 if not ok:
                     rows.append(ReportRow(box_type_m=""))
+                if save_every and len(rows) % save_every == 0:
+                    _save_snapshot(rows, output_dir, start, end)
     finally:
         try:
             driver.quit()
@@ -256,7 +367,7 @@ def crawl(start: str, end: str, pages: int, output_dir: str, headless: bool = Tr
         df["target"] = s.str.extract(r"(\d[\d,]*)", expand=False).fillna(s.str.strip())
     if "rating" in df.columns:
         s = df["rating"].fillna("").astype(str)
-        df["rating"] = s.str.replace(r"^\s*[^\s|:：]+\s*[:：]?\s*", "", regex=True).str.strip()
+        df["rating"] = s.str.replace(r"^\s*[^:|]+[:|]\s*", "", regex=True).str.strip()
 
     # Option A: split equity and reconstruct title/content
     parts = df["equity"].fillna("").astype(str).str.split(r"\s+", n=1, regex=True)
@@ -290,8 +401,10 @@ def main(argv: List[str] | None = None) -> int:
     p.add_argument("--start", default=DEFAULT_START, help="start date YYYY-MM-DD")
     p.add_argument("--end", default=DEFAULT_END, help="end date YYYY-MM-DD")
     p.add_argument("--pages", type=int, default=DEFAULT_PAGES, help="number of list pages to crawl")
+    p.add_argument("--start-page", type=int, default=DEFAULT_START_PAGE, help="page number to start from (1-based)")
     p.add_argument("--output", default=DEFAULT_OUTPUT, help="directory to save CSV")
     p.add_argument("--no-headless", action="store_true", help="run Chrome with UI")
+    p.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY, help="save partial parquet every N rows (0 disables)")
     args = p.parse_args(argv)
 
     try:
@@ -300,8 +413,10 @@ def main(argv: List[str] | None = None) -> int:
             start=args.start,
             end=args.end,
             pages=max(1, args.pages),
+            start_page=max(1, args.start_page),
             output_dir=args.output,
             headless=headless,
+            save_every=max(0, args.save_every),
         )
         print(f"Saved: {path}")
         return 0
