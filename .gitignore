@@ -4,6 +4,8 @@
 /.vscode/
 /scripts
 cookies.txt
+/backtest
+
 
 # Python cache / virtualenv clutter
 __pycache__/
@@ -26,3 +28,5 @@ Thumbs.db
 # Secrets
 .env
 .env.*
+
+
