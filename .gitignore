@@ -3,8 +3,9 @@
 /venv/
 /.vscode/
 /scripts
-cookies.txt
+*cookies.txt
 /backtest
+/outputs
 
 
 # Python cache / virtualenv clutter
